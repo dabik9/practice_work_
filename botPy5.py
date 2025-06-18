@@ -4,9 +4,12 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.types import Message
 import sqlite3
 import hashlib
 from datetime import datetime, timedelta
+
+drop_users_list = []
 
 # Настройка логирования
 logging.basicConfig(
@@ -199,8 +202,7 @@ async def show_main_menu(message: types.Message, user_id: int):
     
     builder.adjust(2)
     await message.answer(
-        "Главное меню:" 
-        "  для подсказок напишите /подсказки",
+        "Главное меню:\nДля подсказок напишите /подсказки",
         reply_markup=builder.as_markup(resize_keyboard=True)
     )
 
@@ -256,12 +258,13 @@ async def show_help(message: types.Message):
         help_text += "База знаний - Доступ к учебным материалам и их управление\n"
         help_text += "Администрирование - Управление пользователями\n"
         help_text += "Добавить пользователя - Зарегистрировать нового пользователя\n"
-        help_text += "Список пользователей - Просмотр всех зарегистрированных пользователей\n\n"
+        help_text += "Список пользователей - Просмотр всех зарегистрированных пользователей\n"
+        help_text += "Удалить пользователя - Удалить пользователя из системы\n\n"
     
     # Для неавторизованных пользователей
     else:
         help_text += "🔹 Для доступа к функциям бота необходимо войти.\n"
-        help_text += "Войти - Начать процесс Входа\n\n"
+        help_text += "Войти - Начать процесс входа\n\n"
     
     await message.answer(help_text)
 
@@ -293,7 +296,7 @@ async def process_password(message: types.Message, state: FSMContext):
     data = await state.get_data()
     pre_data = data['pre_registered_data']
     
-    if password != pre_data[2]:  # В реальной системе используйте hash_password()
+    if password != pre_data[2]:
         await message.answer("Неверный пароль. Попробуйте еще раз.")
         return
     
@@ -373,14 +376,13 @@ async def complete_registration(message: types.Message, state: FSMContext):
 async def logout_user(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
-    # Удаляем пользователя из таблицы зарегистрированных пользователей
     cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     conn.commit()
-
+    
     await state.clear()
-
+    
     builder = ReplyKeyboardBuilder()
-    builder.button(text="Зарегистрироваться")
+    builder.button(text="Войти")
     await message.answer(
         "Вы успешно вышли из аккаунта. Для доступа к боту пройдите верификацию снова.",
         reply_markup=builder.as_markup(resize_keyboard=True)
@@ -507,40 +509,57 @@ async def cancel_send(callback: types.CallbackQuery, state: FSMContext):
 # Обработчики для базы знаний
 @dp.message(F.text == "База знаний")
 async def knowledge_base_menu(message: types.Message, state: FSMContext):
+    user_role = get_user_role(message.from_user.id)
+    
     builder = InlineKeyboardBuilder()
-    builder.button(text="Постоянные материалы", callback_data="kb_permanent")
-    builder.button(text="Временные материалы", callback_data="kb_temporary")
+    builder.button(text="📚 Постоянные материалы", callback_data="kb_permanent")
+    builder.button(text="📌 Временные материалы", callback_data="kb_temporary")
     
-    if get_user_role(message.from_user.id) in ["teacher", "admin"]:
-        builder.button(text="Добавить материал", callback_data="kb_add")
+    if user_role in ["teacher", "admin"]:
+        builder.button(text="➕ Добавить материал", callback_data="kb_add")
+        builder.button(text="✏️ Мои материалы", callback_data="kb_my")
     
-    builder.adjust(2)
-    await message.answer("База знаний:", reply_markup=builder.as_markup())
+    builder.adjust(1)
+    await message.answer("📖 База знаний:", reply_markup=builder.as_markup())
     await state.set_state(KnowledgeBaseState.choosing_category)
 
 @dp.callback_query(F.data.startswith("kb_"), KnowledgeBaseState.choosing_category)
 async def process_kb_category(callback: types.CallbackQuery, state: FSMContext):
     action = callback.data.split("_")[1]
     user_id = callback.from_user.id
-    
-    if action == "back" or action == "main_menu":
-        await show_main_menu(callback.message, user_id)
-        await state.clear()
+
+    if action == "back":
+        await knowledge_base_menu(callback.message, state)
         await callback.answer()
         return
-    
+        
     if action == "permanent":
-        cursor.execute("SELECT id, title FROM knowledge_base WHERE is_permanent = 1 ORDER BY title")
+        cursor.execute("""
+            SELECT id, title FROM knowledge_base 
+            WHERE is_permanent = 1 
+            ORDER BY title
+        """)
         materials = cursor.fetchall()
         title = "📚 Постоянные материалы"
+        
     elif action == "temporary":
-        cursor.execute("SELECT id, title FROM knowledge_base WHERE is_permanent = 0 ORDER BY created_at DESC")
+        cursor.execute("""
+            SELECT id, title FROM knowledge_base 
+            WHERE is_permanent = 0 
+            ORDER BY created_at DESC
+        """)
         materials = cursor.fetchall()
         title = "📌 Временные материалы"
+        
     elif action == "my":
-        cursor.execute("SELECT id, title FROM knowledge_base WHERE author_id = ? ORDER BY created_at DESC", (user_id,))
+        cursor.execute("""
+            SELECT id, title FROM knowledge_base 
+            WHERE author_id = ?
+            ORDER BY created_at DESC
+        """, (user_id,))
         materials = cursor.fetchall()
         title = "✏️ Мои материалы"
+        
     elif action == "add":
         await callback.message.answer("Введите название материала:")
         await state.set_state(KnowledgeBaseState.adding_title)
@@ -548,40 +567,282 @@ async def process_kb_category(callback: types.CallbackQuery, state: FSMContext):
         return
     
     if not materials:
-        await callback.message.answer(f"{title} не найдены.")
+        await callback.message.answer("Материалы не найдены.")
         await callback.answer()
         return
     
     builder = InlineKeyboardBuilder()
     for material in materials:
         builder.button(text=material[1], callback_data=f"material_{material[0]}")
-    builder.button(text="🔙 В главное меню", callback_data="main_menu")
     builder.adjust(1)
     
     await callback.message.answer(title, reply_markup=builder.as_markup())
     await callback.answer()
 
-@dp.message(KnowledgeBaseState.adding_content)
-async def add_knowledge_base_content(message: types.Message, state: FSMContext):
-    await message.answer(f"Материал '{message.text}' будет добавлен в базу знаний.")
+@dp.callback_query(F.data == "main_menu")
+async def back_to_main_menu(callback: types.CallbackQuery, state: FSMContext):
+    await show_main_menu(callback.message, callback.from_user.id)
     await state.clear()
+    await callback.answer()
+
+@dp.message(KnowledgeBaseState.adding_title)
+async def process_add_title(message: types.Message, state: FSMContext):
+    await state.update_data(title=message.text)
+    await message.answer("Введите содержание материала:")
+    await state.set_state(KnowledgeBaseState.adding_text)
+
+@dp.message(KnowledgeBaseState.adding_text)
+async def process_add_text(message: types.Message, state: FSMContext):
+    await state.update_data(content=message.text)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Учебные материалы", callback_data="category_study")
+    builder.button(text="Методички", callback_data="category_methods")
+    builder.button(text="Расписание", callback_data="category_schedule")
+    builder.button(text="Другое", callback_data="category_other")
+    
+    await message.answer("Выберите категорию:", reply_markup=builder.as_markup())
+    await state.set_state(KnowledgeBaseState.adding_category)
+
+@dp.callback_query(F.data.startswith("category_"), KnowledgeBaseState.adding_category)
+async def process_add_category(callback: types.CallbackQuery, state: FSMContext):
+    category = callback.data.split("_")[1]
+    await state.update_data(category=category)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Постоянный материал", callback_data="permanent_1")
+    builder.button(text="Временный материал", callback_data="permanent_0")
+    
+    await callback.message.answer("Выберите тип материала:", reply_markup=builder.as_markup())
+    await state.set_state(KnowledgeBaseState.setting_permanent)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("permanent_"), KnowledgeBaseState.setting_permanent)
+async def process_set_permanent(callback: types.CallbackQuery, state: FSMContext):
+    is_permanent = bool(int(callback.data.split("_")[1]))
+    user_data = await state.get_data()
+    user_id = callback.from_user.id
+    
+    cursor.execute("""
+        INSERT INTO knowledge_base 
+        (title, content, category, is_permanent, created_at, updated_at, author_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_data['title'],
+        user_data['content'],
+        user_data['category'],
+        is_permanent,
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        user_id
+    ))
+    conn.commit()
+    
+    await callback.message.answer("✅ Материал успешно добавлен в базу знаний!")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("material_"))
+async def view_material(callback: types.CallbackQuery, state: FSMContext):
+    material_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    cursor.execute("""
+        SELECT title, content, category, is_permanent, created_at, author_id 
+        FROM knowledge_base 
+        WHERE id = ?
+    """, (material_id,))
+    material = cursor.fetchone()
+    
+    if not material:
+        await callback.answer("Материал не найден!")
+        return
+    
+    title, content, category, is_permanent, created_at, author_id = material
+    author_name = get_user_full_name(author_id)
+    
+    text = f"<b>{title}</b>\n\n"
+    text += f"{content}\n\n"
+    text += f"📁 Категория: {category}\n"
+    text += f"📅 Дата создания: {created_at}\n"
+    text += f"👤 Автор: {author_name}\n"
+    text += "🔒 Тип: " + ("Постоянный" if is_permanent else "Временный")
+    
+    builder = InlineKeyboardBuilder()
+    
+    if user_id == author_id or get_user_role(user_id) == "admin":
+        builder.button(text="✏️ Редактировать", callback_data=f"edit_{material_id}")
+        builder.button(text="🗑️ Удалить", callback_data=f"delete_{material_id}")
+        builder.adjust(2)
+    
+    builder.button(text="🔙 В главное меню", callback_data="main_menu")
+    
+    await callback.message.answer(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_"))
+async def edit_material(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    material_id = int(parts[-1])
+    user_id = callback.from_user.id
+    
+    cursor.execute("SELECT author_id FROM knowledge_base WHERE id = ?", (material_id,))
+    result = cursor.fetchone()
+    
+    if not result or (user_id != result[0] and get_user_role(user_id) != "admin"):
+        await callback.answer("У вас нет прав для редактирования!")
+        return
+    
+    if len(parts) == 2:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Название", callback_data=f"edit_title_{material_id}")
+        builder.button(text="Содержание", callback_data=f"edit_content_{material_id}")
+        builder.button(text="Категорию", callback_data=f"edit_category_{material_id}")
+        builder.button(text="Тип", callback_data=f"edit_permanent_{material_id}")
+        builder.adjust(2)
+        
+        await callback.message.answer("Что вы хотите изменить?", reply_markup=builder.as_markup())
+        await callback.answer()
+        return
+    
+    field = parts[1]
+    await state.update_data(
+        edit_field=field,
+        material_id=material_id
+    )
+    
+    if field == 'permanent':
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Постоянный", callback_data="permanent_1")
+        builder.button(text="Временный", callback_data="permanent_0")
+        await callback.message.answer("Выберите тип материала:", reply_markup=builder.as_markup())
+    elif field == 'category':
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Учебные материалы", callback_data="category_study")
+        builder.button(text="Методички", callback_data="category_methods")
+        builder.button(text="Расписание", callback_data="category_schedule")
+        builder.button(text="Другое", callback_data="category_other")
+        await callback.message.answer("Выберите категорию:", reply_markup=builder.as_markup())
+    else:
+        await callback.message.answer(f"Введите новое значение для {field}:")
+        await state.set_state(KnowledgeBaseState.editing_content)
+    
+    await callback.answer()
+
+@dp.message(KnowledgeBaseState.editing_content)
+async def save_edited_material(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    material_id = data['material_id']
+    field = data['edit_field']
+    new_value = message.text
+    
+    cursor.execute(f"""
+        UPDATE knowledge_base 
+        SET {field} = ?, updated_at = ?
+        WHERE id = ?
+    """, (
+        new_value,
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        material_id
+    ))
+    conn.commit()
+    
+    await message.answer("✅ Изменения сохранены!")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith(("category_", "permanent_")))
+async def save_selected_option(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    material_id = data['material_id']
+    field = data['edit_field']
+    
+    if callback.data.startswith("category_"):
+        new_value = callback.data.split("_")[1]
+    else:
+        new_value = int(callback.data.split("_")[1])
+    
+    cursor.execute(f"""
+        UPDATE knowledge_base 
+        SET {field} = ?, updated_at = ?
+        WHERE id = ?
+    """, (
+        new_value,
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        material_id
+    ))
+    conn.commit()
+    
+    await callback.message.answer("✅ Изменения сохранены!")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_"))
+async def delete_material(callback: types.CallbackQuery):
+    material_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    cursor.execute("SELECT author_id FROM knowledge_base WHERE id = ?", (material_id,))
+    result = cursor.fetchone()
+    
+    if not result or (user_id != result[0] and get_user_role(user_id) != "admin"):
+        await callback.answer("У вас нет прав для удаления!")
+        return
+    
+    cursor.execute("DELETE FROM knowledge_base WHERE id = ?", (material_id,))
+    conn.commit()
+    
+    await callback.message.answer("Материал удален!")
+    await callback.answer()
+    await callback.message.delete()
 
 # Обработчики для администрирования
 @dp.message(F.text == "Администрирование")
-async def admin_panel(message: types.Message, state: FSMContext):
+async def admin_panel(message: types.Message):
     if get_user_role(message.from_user.id) != "admin":
-        await message.answer("Доступ запрещен.")
+        await message.answer("Доступ запрещён.")
         return
     
     builder = ReplyKeyboardBuilder()
     builder.button(text="Добавить пользователя")
     builder.button(text="Список пользователей")
+    builder.button(text="Удалить пользователя")
     builder.button(text="Назад")
+    builder.adjust(2)
     
     await message.answer(
         "Админ-панель:",
         reply_markup=builder.as_markup(resize_keyboard=True)
     )
+
+@dp.message(F.text == "Удалить пользователя")
+async def drop_user_button(message: types.Message, state: FSMContext):
+    if get_user_role(message.from_user.id) != "admin":
+        await message.answer("Доступ запрещён.")
+        return
+    
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="Выйти из меню удаления пользователей")
+    await message.answer(text="Введите id пользователя для удаления:")
+    drop_users_list.append(message.chat.id)
+
+@dp.message()
+async def drop_user(message: Message, bot: Bot):
+    if message.chat.id in drop_users_list:
+        if message.text == "Выйти из меню удаления пользователей":
+            drop_users_list.remove(message.chat.id)
+            await message.answer("Выход из меню удаления пользователей.")
+            return
+            
+        cursor.execute('SELECT * FROM pre_registered_users WHERE id=?', (message.text,))
+        info = cursor.fetchall()
+        if not info:
+            await message.answer("Такого пользователя не существует")
+            return
+            
+        cursor.execute('DELETE FROM pre_registered_users WHERE id=?', (message.text,))
+        conn.commit()
+        await message.answer("Пользователь успешно удалён!")
+        drop_users_list.remove(message.chat.id)
 
 @dp.message(F.text == "Список пользователей")
 async def list_users_command(message: types.Message):
@@ -657,12 +918,6 @@ async def process_new_user_data(message: types.Message, state: FSMContext):
         await message.answer("Ошибка в формате данных. Попробуйте еще раз.")
     
     await state.clear()
-
-@dp.callback_query(F.data == "main_menu")
-async def back_to_main_menu(callback: types.CallbackQuery, state: FSMContext):
-    await show_main_menu(callback.message, callback.from_user.id)
-    await state.clear()
-    await callback.answer()
 
 # Запуск бота
 async def main():
