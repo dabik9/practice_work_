@@ -1,0 +1,1423 @@
+import logging
+import sqlite3
+import hashlib
+import asyncio
+import re
+from datetime import datetime, timedelta
+from typing import Optional
+from html import escape
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Инициализация бота
+bot = Bot(token="7014679556:AAGPqYwhEIQ7jD7uhidFQg4GwfV2pCEOo88")
+dp = Dispatcher()
+
+# Подключение к БД с настройкой timeout и проверкой соединения
+def get_db_connection():
+    conn = sqlite3.connect('New db education.db', check_same_thread=False, timeout=10)
+    conn.execute("PRAGMA foreign_keys = ON")  # Включаем проверку внешних ключей
+    return conn
+
+conn = get_db_connection()
+cursor = conn.cursor()
+
+# FSM-состояния
+class AuthState(StatesGroup):
+    waiting_for_login = State()
+    waiting_for_password = State()
+    waiting_for_full_name = State()
+    waiting_for_group = State()
+    waiting_for_student_id = State()
+
+class MessageState(StatesGroup):
+    waiting_for_recipient = State()
+    waiting_for_message_text = State()
+    waiting_for_confirmation = State()
+
+class ScheduleState(StatesGroup):
+    waiting_for_start_time = State()
+    waiting_for_end_time = State()
+
+class KnowledgeBaseState(StatesGroup):
+    choosing_category = State()
+    adding_title = State()
+    adding_text = State()
+    adding_category = State()
+    setting_permanent = State()
+    editing_content = State()
+    editing_title = State()
+    editing_text = State()
+    editing_category = State()
+    confirming_edit = State()
+
+class AdminState(StatesGroup):
+    waiting_for_new_user_data = State()
+
+# Вспомогательные функции с проверками безопасности
+def hash_password(password: str) -> str:
+    """Функция остается, но не используется для проверки паролей"""
+    salt = "s3cr3t_s4lt"
+    return hashlib.sha256((password + salt).encode()).hexdigest()
+
+def validate_login(login: str) -> bool:
+    """Проверка логина на допустимые символы"""
+    return bool(re.match(r'^[a-zA-Z0-9_\-]{3,20}$', login))
+
+def validate_name(name: str) -> bool:
+    """Проверка ФИО на допустимые символы"""
+    return bool(re.match(r'^[a-zA-Zа-яА-ЯёЁ\- ]{2,50}$', name))
+
+def validate_group(group: str) -> bool:
+    """Проверка названия группы"""
+    return bool(re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9\- ]{2,20}$', group))
+
+def validate_student_id(student_id: str) -> bool:
+    """Проверка номера студенческого"""
+    return student_id.isdigit() and len(student_id) == 8
+
+def get_user_role(user_id: int) -> Optional[str]:
+    """Получение роли пользователя с проверкой верификации"""
+    try:
+        cursor.execute(
+            "SELECT role FROM users WHERE user_id = ? AND is_verified = TRUE",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_user_role: {e}")
+        return None
+
+def get_user_full_name(user_id: int) -> str:
+    """Получение ФИО пользователя с экранированием вывода"""
+    try:
+        cursor.execute(
+            "SELECT full_name FROM users WHERE user_id = ? AND is_verified = TRUE",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        return escape(row[0]) if row else "Unknown"
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_user_full_name: {e}")
+        return "Unknown"
+
+def can_send_message(sender: int, recipient: int) -> bool:
+    """Проверка возможности отправки сообщения с обработкой ошибок"""
+    try:
+        sender_role = get_user_role(sender)
+        recipient_role = get_user_role(recipient)
+        if not sender_role or not recipient_role:
+            return False
+        
+        cursor.execute(
+            "SELECT start_time, end_time FROM message_schedule WHERE user_id = ?",
+            (recipient,)
+        )
+        sch = cursor.fetchone()
+        
+        if sch:
+            now = datetime.now().time()
+            start = datetime.strptime(sch[0], "%H:%M").time()
+            end = datetime.strptime(sch[1], "%H:%M").time()
+            if not (start <= now <= end):
+                return False
+        
+        if sender_role == "admin":
+            return True
+        if sender_role == "teacher":
+            return recipient_role in ("teacher", "student", "admin")
+        if sender_role == "student":
+            return recipient_role == "teacher"
+        return False
+    except (sqlite3.Error, ValueError) as e:
+        logger.error(f"Error in can_send_message: {e}")
+        return False
+
+def get_last_message_time(user_id: int) -> Optional[datetime]:
+    """Получение времени последнего сообщения с обработкой ошибок"""
+    try:
+        cursor.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE from_user_id = ?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            return datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_last_message_time: {e}")
+        return None
+
+def can_user_send_message_now(user_id: int) -> bool:
+    """Проверка временного интервала между сообщениями"""
+    last = get_last_message_time(user_id)
+    if not last:
+        return True
+    return datetime.now() - last > timedelta(minutes=30)
+
+def get_student_groups():
+    """Получение списка групп студентов с обработкой ошибок"""
+    try:
+        cursor.execute("SELECT DISTINCT group_name FROM users WHERE role='student' AND is_verified=TRUE")
+        return [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_student_groups: {e}")
+        return []
+
+async def show_main_menu(msg: types.Message, user_id: int):
+    """Отображение главного меню с проверкой роли"""
+    role = get_user_role(user_id)
+    if not role:
+        return await msg.answer("Доступ запрещен.")
+    
+    kb = ReplyKeyboardBuilder()
+    if role == "student":
+        kb.button(text="Написать преподавателю")
+        kb.button(text="База знаний")
+    elif role == "teacher":
+        kb.button(text="Написать студенту")
+        kb.button(text="Написать преподавателю")
+        kb.button(text="Написать администратору")
+        kb.button(text="База знаний")
+        kb.button(text="⏰ Настройка времени приема")
+    elif role == "admin":
+        kb.button(text="Написать студенту")
+        kb.button(text="Написать преподавателю")
+        kb.button(text="Написать администратору")
+        kb.button(text="База знаний")
+        kb.button(text="Администрирование")
+        kb.button(text="⏰ Настройка времени приема")
+    
+    kb.adjust(2, repeat=True)
+    kb.row(types.KeyboardButton(text="🚪 Выйти из аккаунта"))
+    await msg.answer("Главное меню:", reply_markup=kb.as_markup(resize_keyboard=True))
+
+# Инициализация БД с обработкой ошибок
+def setup_database():
+    """Инициализация структуры базы данных"""
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                login TEXT UNIQUE,
+                password TEXT,
+                full_name TEXT,
+                role TEXT CHECK(role IN ('student','teacher','admin')),
+                group_name TEXT,
+                student_id TEXT,
+                is_verified BOOLEAN DEFAULT FALSE
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pre_registered_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                login TEXT UNIQUE,
+                password TEXT,
+                full_name TEXT,
+                role TEXT CHECK(role IN ('student','teacher','admin')),
+                group_name TEXT,
+                student_id TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_user_id INTEGER,
+                to_user_id INTEGER,
+                text TEXT,
+                timestamp DATETIME,
+                is_read BOOLEAN DEFAULT FALSE,
+                FOREIGN KEY(from_user_id) REFERENCES users(user_id),
+                FOREIGN KEY(to_user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS knowledge_base (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                content TEXT,
+                category TEXT,
+                is_permanent BOOLEAN,
+                created_at DATETIME,
+                updated_at DATETIME,
+                author_id INTEGER,
+                FOREIGN KEY(author_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS message_schedule (
+                user_id INTEGER PRIMARY KEY,
+                start_time TEXT,
+                end_time TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error initializing database: {e}")
+        raise
+
+# /start
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    """Обработка команды /start"""
+    await state.clear()
+    try:
+        cursor.execute(
+            "SELECT 1 FROM users WHERE user_id = ? AND is_verified = TRUE",
+            (message.from_user.id,)
+        )
+        if cursor.fetchone():
+            await show_main_menu(message, message.from_user.id)
+        else:
+            kb = ReplyKeyboardBuilder().button(text="Войти")
+            await message.answer(
+                "Добро пожаловать! Пройдите верификацию.",
+                reply_markup=kb.as_markup(resize_keyboard=True)
+            )
+    except sqlite3.Error as e:
+        logger.error(f"Database error in cmd_start: {e}")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
+
+# Выход
+@dp.message(F.text == "🚪 Выйти из аккаунта")
+async def ask_logout(message: types.Message, state: FSMContext):
+    """Запрос подтверждения выхода"""
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="✅ Да, выйти")
+    kb.button(text="❌ Отмена")
+    kb.adjust(2)
+    await message.answer("Вы уверены?", reply_markup=kb.as_markup())
+    await state.set_state("confirm_logout")
+
+@dp.message(StateFilter("confirm_logout"), F.text.in_(["✅ Да, выйти","❌ Отмена"]))
+async def handle_logout(message: types.Message, state: FSMContext):
+    """Обработка подтверждения выхода"""
+    if message.text == "✅ Да, выйти":
+        try:
+            cursor.execute(
+                "UPDATE users SET is_verified = FALSE WHERE user_id = ?",
+                (message.from_user.id,)
+            )
+            conn.commit()
+            kb = ReplyKeyboardBuilder().button(text="Войти")
+            await message.answer(
+                "Вы вышли.",
+                reply_markup=kb.as_markup(resize_keyboard=True)
+            )
+        except sqlite3.Error as e:
+            logger.error(f"Database error in handle_logout: {e}")
+            await message.answer("Произошла ошибка при выходе.")
+    else:
+        await message.answer("Отмена.")
+        await show_main_menu(message, message.from_user.id)
+    await state.clear()
+
+# Вход
+@dp.message(F.text == "Войти")
+async def start_login(message: types.Message, state: FSMContext):
+    """Начало процесса входа"""
+    await message.answer("Логин:")
+    await state.set_state(AuthState.waiting_for_login)
+
+@dp.message(AuthState.waiting_for_login)
+async def process_login(message: types.Message, state: FSMContext):
+    """Обработка логина с валидацией"""
+    login = message.text.strip()
+    if not validate_login(login):
+        return await message.answer("Логин содержит недопустимые символы. Используйте только буквы, цифры, дефисы и подчеркивания.")
+    
+    try:
+        cursor.execute(
+            "SELECT * FROM pre_registered_users WHERE login = ?",
+            (login,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return await message.answer("Логин не найден.")
+        
+        await state.update_data(pre_data=row, login=login)
+        await message.answer("Пароль:")
+        await state.set_state(AuthState.waiting_for_password)
+    except sqlite3.Error as e:
+        logger.error(f"Database error in process_login: {e}")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
+
+@dp.message(AuthState.waiting_for_password)
+async def process_password(message: types.Message, state: FSMContext):
+    """Обработка пароля (сравниваем в чистом виде)"""
+    pwd = message.text.strip()
+    data = await state.get_data()
+    pre = data['pre_data']
+    
+    # Сравниваем пароли без хеширования
+    if pwd != pre[2]:  # Индекс 2 соответствует полю password в pre_registered_users
+        return await message.answer("Неверный пароль.")
+    
+    if pre[4] == "student":  # Индекс 4 соответствует полю role
+        await message.answer("Полное ФИО:")
+        await state.set_state(AuthState.waiting_for_full_name)
+    else:
+        await complete_registration(message, state)
+
+@dp.message(AuthState.waiting_for_full_name)
+async def process_full_name(message: types.Message, state: FSMContext):
+    """Проверка ФИО студента"""
+    full_name = message.text.strip()
+    if not validate_name(full_name):
+        return await message.answer("ФИО содержит недопустимые символы.")
+    
+    data = await state.get_data()
+    if full_name.lower() != data['pre_data'][3].lower():  # Индекс 3 соответствует полю full_name
+        return await message.answer("ФИО не совпадает.")
+    
+    await state.update_data(full_name=full_name)
+    await message.answer("Группа:")
+    await state.set_state(AuthState.waiting_for_group)
+
+@dp.message(AuthState.waiting_for_group)
+async def process_group(message: types.Message, state: FSMContext):
+    """Проверка группы студента"""
+    group = message.text.strip()
+    if not validate_group(group):
+        return await message.answer("Название группы содержит недопустимые символы.")
+    
+    data = await state.get_data()
+    if group.lower() != data['pre_data'][5].lower():  # Индекс 5 соответствует полю group_name
+        return await message.answer("Группа не совпадает.")
+    
+    await state.update_data(group=group)
+    await message.answer("Номер студенческого:")
+    await state.set_state(AuthState.waiting_for_student_id)
+
+@dp.message(AuthState.waiting_for_student_id)
+async def process_student_id(message: types.Message, state: FSMContext):
+    """Проверка номера студенческого"""
+    student_id = message.text.strip().upper()
+    if not validate_student_id(student_id):
+        return await message.answer("Номер студенческого должен состоять из 8 цифр.")
+    
+    data = await state.get_data()
+    if student_id != data['pre_data'][6]:  # Индекс 6 соответствует полю student_id
+        return await message.answer("Номер не совпадает.")
+    
+    await complete_registration(message, state)
+
+async def complete_registration(message: types.Message, state: FSMContext):
+    """Завершение регистрации пользователя"""
+    data = await state.get_data()
+    pre = data['pre_data']
+    uid = message.from_user.id
+    
+    try:
+        cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
+        exists = cursor.fetchone()
+        
+        if exists:
+            cursor.execute("""
+                UPDATE users SET
+                  login=?, password=?, full_name=?, role=?,
+                  group_name=?, student_id=?, is_verified=TRUE
+                WHERE user_id=?
+            """, (
+                pre[1], pre[2], pre[3], pre[4],
+                pre[5] if pre[4]=="student" else None,
+                pre[6] if pre[4]=="student" else None,
+                uid
+            ))
+        else:
+            cursor.execute("""
+                INSERT INTO users
+                  (user_id,login,password,full_name,role,group_name,student_id,is_verified)
+                VALUES (?,?,?,?,?,?,?,TRUE)
+            """, (
+                uid, pre[1], pre[2], pre[3], pre[4],
+                pre[5] if pre[4]=="student" else None,
+                pre[6] if pre[4]=="student" else None
+            ))
+        
+        conn.commit()
+        await message.answer(f"Добро пожаловать, {escape(pre[3])}!")
+        await show_main_menu(message, uid)
+    except sqlite3.Error as e:
+        logger.error(f"Database error in complete_registration: {e}")
+        await message.answer("Произошла ошибка при регистрации. Попробуйте позже.")
+    finally:
+        await state.clear()
+
+
+# Написать сообщение
+@dp.message(F.text.startswith("Написать"))
+async def write_message(message: types.Message, state: FSMContext):
+    """Обработка команды написать сообщение"""
+    role = get_user_role(message.from_user.id)
+    if not role:
+        return await message.answer("Доступ запрещен.")
+    
+    target = message.text.split()[-1]
+    
+    try:
+        if target == "преподавателю":
+            cursor.execute("SELECT user_id, full_name FROM users WHERE role='teacher' AND is_verified=TRUE")
+            rows = cursor.fetchall()
+            if not rows:
+                return await message.answer("Нет доступных преподавателей.")
+            
+            kb = InlineKeyboardBuilder()
+            for uid, name in rows:
+                kb.button(text=escape(name), callback_data=f"select_recipient_{uid}")
+            kb.adjust(1)
+            await message.answer("Выберите получателя:", reply_markup=kb.as_markup())
+            await state.set_state(MessageState.waiting_for_recipient)
+        
+        elif target == "студенту":
+            if role in ("teacher", "admin"):
+                groups = get_student_groups()
+                if not groups:
+                    return await message.answer("Нет доступных групп студентов.")
+                
+                kb = InlineKeyboardBuilder()
+                for group in groups:
+                    kb.button(text=f"👥 Группа: {escape(group)}", callback_data=f"select_group_{group}")
+                    cursor.execute(
+                        "SELECT user_id, full_name FROM users WHERE role='student' AND group_name=? AND is_verified=TRUE", 
+                        (group,))
+                    for uid, name in cursor.fetchall():
+                        kb.button(text=f"👤 {escape(name)} ({escape(group)})", callback_data=f"select_recipient_{uid}")
+                kb.adjust(1)
+                await message.answer("Выберите группу или отдельного студента:", reply_markup=kb.as_markup())
+                await state.set_state(MessageState.waiting_for_recipient)
+            else:
+                cursor.execute("SELECT user_id, full_name FROM users WHERE role='teacher' AND is_verified=TRUE")
+                rows = cursor.fetchall()
+                if not rows:
+                    return await message.answer("Нет доступных преподавателей.")
+                
+                kb = InlineKeyboardBuilder()
+                for uid, name in rows:
+                    kb.button(text=escape(name), callback_data=f"select_recipient_{uid}")
+                kb.adjust(1)
+                await message.answer("Выберите получателя:", reply_markup=kb.as_markup())
+                await state.set_state(MessageState.waiting_for_recipient)
+        
+        elif target == "администратору":
+            cursor.execute("SELECT user_id, full_name FROM users WHERE role='admin' AND is_verified=TRUE")
+            rows = cursor.fetchall()
+            if not rows:
+                return await message.answer("Нет доступных администраторов.")
+            
+            kb = InlineKeyboardBuilder()
+            for uid, name in rows:
+                kb.button(text=escape(name), callback_data=f"select_recipient_{uid}")
+            kb.adjust(1)
+            await message.answer("Выберите получателя:", reply_markup=kb.as_markup())
+            await state.set_state(MessageState.waiting_for_recipient)
+    except sqlite3.Error as e:
+        logger.error(f"Database error in write_message: {e}")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
+
+@dp.callback_query(F.data.startswith("select_recipient_"), MessageState.waiting_for_recipient)
+async def select_recipient(callback: types.CallbackQuery, state: FSMContext):
+    """Выбор получателя сообщения"""
+    try:
+        rid = int(callback.data.split("_")[-1])
+        await state.update_data(recipient_id=rid)
+        await callback.message.answer("Текст сообщения:")
+        await state.set_state(MessageState.waiting_for_message_text)
+    except (ValueError, IndexError):
+        await callback.message.answer("Ошибка выбора получателя.")
+    finally:
+        await callback.answer()
+
+@dp.callback_query(F.data.startswith("select_group_"), MessageState.waiting_for_recipient)
+async def select_group(callback: types.CallbackQuery, state: FSMContext):
+    """Выбор группы для отправки сообщения"""
+    try:
+        group = callback.data[len("select_group_"):]
+        if not validate_group(group):
+            await callback.message.answer("Недопустимое название группы.")
+            return
+            
+        await state.update_data(group_name=group)
+        await callback.message.answer(f"Введите текст сообщения для группы {escape(group)}:")
+        await state.set_state(MessageState.waiting_for_message_text)
+    except Exception as e:
+        logger.error(f"Error in select_group: {e}")
+        await callback.message.answer("Произошла ошибка.")
+    finally:
+        await callback.answer()
+
+@dp.message(MessageState.waiting_for_message_text)
+async def process_message_text(message: types.Message, state: FSMContext):
+    """Обработка текста сообщения"""
+    if not can_user_send_message_now(message.from_user.id):
+        await message.answer("Нельзя отправлять сообщения чаще чем раз в 30 минут.")
+        return await state.clear()
+    
+    # Ограничение длины сообщения
+    if len(message.text) > 2000:
+        await message.answer("Сообщение слишком длинное. Максимум 2000 символов.")
+        return
+    
+    await state.update_data(message_text=message.text)
+    data = await state.get_data()
+    sender = message.from_user.id
+    
+    preview = (
+        f"🔹 {get_user_full_name(sender)} ({get_user_role(sender)})\n"
+        f"   {escape(message.text)}\n"
+        f"🕒 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Отправить", callback_data="confirm_send")
+    kb.button(text="Отменить", callback_data="cancel_send")
+    kb.adjust(2)
+    
+    await message.answer(f"Подтвердите:\n\n{preview}", reply_markup=kb.as_markup())
+    await state.set_state(MessageState.waiting_for_confirmation)
+
+@dp.callback_query(F.data == "confirm_send", MessageState.waiting_for_confirmation)
+async def confirm_send(callback: types.CallbackQuery, state: FSMContext):
+    """Подтверждение отправки сообщения"""
+    data = await state.get_data()
+    sender = callback.from_user.id
+    text = data['message_text']
+    group = data.get('group_name')
+    
+    try:
+        if group:
+            # Отправка всем студентам из группы
+            cursor.execute(
+                "SELECT user_id FROM users WHERE role='student' AND group_name=? AND is_verified=TRUE",
+                (group,)
+            )
+            recipients = [row[0] for row in cursor.fetchall()]
+            
+            if not recipients:
+                await callback.message.answer("В группе нет студентов.")
+                await state.clear()
+                return await callback.answer()
+            
+            success_count = 0
+            for recipient in recipients:
+                if can_send_message(sender, recipient):
+                    cursor.execute(
+                        "INSERT INTO messages (from_user_id,to_user_id,text,timestamp) VALUES (?,?,?,?)",
+                        (sender, recipient, text, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                    )
+                    try:
+                        await bot.send_message(
+                            recipient,
+                            f"🔹 {get_user_full_name(sender)} ({get_user_role(sender)})\n"
+                            f"   {escape(text)}\n"
+                            f"🕒 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+                        )
+                        success_count += 1
+                    except Exception as e:
+                        logger.error(f"Error sending message to {recipient}: {e}")
+            
+            conn.commit()
+            await callback.message.answer(f"Сообщение отправлено {success_count} студентам!")
+        else:
+            # Отправка одному пользователю
+            recipient = data['recipient_id']
+            if not can_send_message(sender, recipient):
+                await callback.message.answer("Нельзя отправить сообщение этому пользователю.")
+                await state.clear()
+                return await callback.answer()
+            
+            cursor.execute(
+                "INSERT INTO messages (from_user_id,to_user_id,text,timestamp) VALUES (?,?,?,?)",
+                (sender, recipient, text, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            conn.commit()
+            
+            try:
+                await bot.send_message(
+                    recipient,
+                    f"🔹 {get_user_full_name(sender)} ({get_user_role(sender)})\n"
+                    f"   {escape(text)}\n"
+                    f"🕒 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+                )
+                await callback.message.answer("Сообщение отправлено!")
+            except Exception as e:
+                logger.error(f"Error sending message: {e}")
+                await callback.message.answer("Сообщение сохранено, но не доставлено.")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in confirm_send: {e}")
+        await callback.message.answer("Произошла ошибка при отправке сообщения.")
+    finally:
+        await state.clear()
+        await callback.answer()
+
+@dp.callback_query(F.data == "cancel_send", MessageState.waiting_for_confirmation)
+async def cancel_send(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена отправки сообщения"""
+    await callback.message.answer("Отправка отменена.")
+    await state.clear()
+    await callback.answer()
+
+# База знаний
+@dp.message(F.text == "База знаний")
+async def kb_menu(message: types.Message, state: FSMContext):
+    """Меню базы знаний"""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Постоянные материалы", callback_data="kb_permanent")
+    kb.button(text="Временные материалы", callback_data="kb_temporary")
+    
+    if get_user_role(message.from_user.id) in ("teacher","admin"):
+        kb.button(text="Добавить материал", callback_data="kb_add")
+    
+    kb.adjust(1)
+    await message.answer("База знаний:", reply_markup=kb.as_markup())
+    await state.set_state(KnowledgeBaseState.choosing_category)
+
+@dp.callback_query(F.data.startswith("kb_"), KnowledgeBaseState.choosing_category)
+async def process_kb_category(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка выбора категории в базе знаний"""
+    action = callback.data.split("_")[1]
+    uid = callback.from_user.id
+    
+    if action == "add":
+        await callback.message.answer("Введите название материала:")
+        await state.set_state(KnowledgeBaseState.adding_title)
+        return await callback.answer()
+    
+    try:
+        if action == "permanent":
+            cursor.execute("SELECT id,title FROM knowledge_base WHERE is_permanent=1 ORDER BY title")
+            title = "Постоянные материалы:"
+        else:
+            cursor.execute("SELECT id,title FROM knowledge_base WHERE is_permanent=0 ORDER BY created_at DESC")
+            title = "Временные материалы:"
+        
+        rows = cursor.fetchall()
+        if not rows:
+            await callback.message.answer("Материалы не найдены.")
+            return await callback.answer()
+        
+        kb = InlineKeyboardBuilder()
+        for mid, mt in rows:
+            kb.button(text=escape(mt), callback_data=f"material_{mid}")
+        kb.button(text="🔙 Главное меню", callback_data="main_menu")
+        kb.adjust(1)
+        
+        await callback.message.answer(title, reply_markup=kb.as_markup())
+    except sqlite3.Error as e:
+        logger.error(f"Database error in process_kb_category: {e}")
+        await callback.message.answer("Произошла ошибка при загрузке материалов.")
+    finally:
+        await callback.answer()
+
+@dp.message(KnowledgeBaseState.adding_title)
+async def process_material_title(message: types.Message, state: FSMContext):
+    """Обработка названия материала"""
+    if len(message.text) > 100:
+        await message.answer("Название слишком длинное. Максимум 100 символов.")
+        return
+    
+    await state.update_data(title=message.text)
+    await message.answer("Введите содержание материала:")
+    await state.set_state(KnowledgeBaseState.adding_text)
+
+@dp.message(KnowledgeBaseState.adding_text)
+async def process_material_text(message: types.Message, state: FSMContext):
+    """Обработка содержания материала"""
+    if len(message.text) > 5000:
+        await message.answer("Содержание слишком длинное. Максимум 5000 символов.")
+        return
+    
+    await state.update_data(content=message.text)
+    await message.answer("Введите категорию материала:")
+    await state.set_state(KnowledgeBaseState.adding_category)
+
+@dp.message(KnowledgeBaseState.adding_category)
+async def process_material_category(message: types.Message, state: FSMContext):
+    """Обработка категории материала"""
+    if len(message.text) > 50:
+        await message.answer("Название категории слишком длинное. Максимум 50 символов.")
+        return
+    
+    await state.update_data(category=message.text)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Постоянный", callback_data="material_permanent_1")
+    kb.button(text="Временный", callback_data="material_permanent_0")
+    await message.answer("Выберите тип материала:", reply_markup=kb.as_markup())
+    await state.set_state(KnowledgeBaseState.setting_permanent)
+
+@dp.callback_query(F.data.startswith("material_permanent_"), KnowledgeBaseState.setting_permanent)
+async def process_material_permanent(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка типа материала (постоянный/временный)"""
+    is_permanent = bool(int(callback.data.split("_")[-1]))
+    data = await state.get_data()
+    
+    try:
+        cursor.execute(
+            "INSERT INTO knowledge_base (title, content, category, is_permanent, created_at, updated_at, author_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                data['title'],
+                data['content'],
+                data['category'],
+                is_permanent,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                callback.from_user.id
+            )
+        )
+        conn.commit()
+        await callback.message.answer("✅ Материал успешно добавлен в базу знаний!")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in process_material_permanent: {e}")
+        await callback.message.answer("Произошла ошибка при сохранении материала.")
+    finally:
+        await state.clear()
+        await callback.answer()
+
+# Просмотр материала
+@dp.callback_query(F.data.startswith("material_"))
+async def view_material(callback: types.CallbackQuery, state: FSMContext):
+    """Просмотр материала с возможностью редактирования"""
+    try:
+        mid = int(callback.data.split("_")[-1])
+        cursor.execute(
+            "SELECT title,content,category,is_permanent,created_at,author_id FROM knowledge_base WHERE id=?",
+            (mid,)
+        )
+        m = cursor.fetchone()
+        
+        if not m:
+            return await callback.answer("Материал не найден.")
+        
+        title, content, cat, perm, created, aid = m
+        role = get_user_role(callback.from_user.id)
+        can_edit = role == "admin" or (callback.from_user.id == aid and role == "teacher")
+        
+        text = (
+            f"<b>{escape(title)}</b>\n\n{escape(content)}\n\n"
+            f"📁 Категория: {escape(cat)}\n"
+            f"📅 Дата создания: {created}\n"
+            f"🔒 Тип: {'Постоянный' if perm else 'Временный'}"
+        )
+        
+        kb = InlineKeyboardBuilder()
+        if can_edit:
+            kb.button(text="✏️ Изменить материал", callback_data=f"edit_material_{mid}")
+            kb.button(text="🗑 Удалить материал", callback_data=f"delete_material_{mid}")
+        else:
+            kb.button(text="🔙 Главное меню", callback_data="main_menu")
+        kb.adjust(1)
+        
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb.as_markup())
+    except (ValueError, IndexError):
+        await callback.answer("Неверный идентификатор материала")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in view_material: {e}")
+        await callback.answer("Произошла ошибка при загрузке материала")
+    finally:
+        await callback.answer()
+
+# Редактирование материала
+@dp.callback_query(F.data.startswith("edit_material_"))
+async def edit_material_start(callback: types.CallbackQuery, state: FSMContext):
+    """Начало редактирования материала"""
+    try:
+        # Получаем ID материала из callback данных
+        material_id = int(callback.data.split("_")[-1])
+        
+        # Получаем данные материала из БД
+        cursor.execute(
+            "SELECT title, content, category, author_id FROM knowledge_base WHERE id=?",
+            (material_id,)
+        )
+        material = cursor.fetchone()
+        
+        if not material:
+            await callback.answer("Материал не найден.")
+            return
+        
+        title, content, category, author_id = material
+        
+        # Проверяем права на редактирование
+        user_role = get_user_role(callback.from_user.id)
+        if user_role != "admin" and (callback.from_user.id != author_id or user_role != "teacher"):
+            await callback.answer("У вас нет прав на редактирование этого материала.")
+            return
+        
+        # Сохраняем данные в состоянии
+        await state.update_data(
+            material_id=material_id,
+            title=title,
+            content=content,
+            category=category
+        )
+        
+        # Запрашиваем новый заголовок
+        await callback.message.answer(
+            f"Текущий заголовок:\n{escape(title)}\n\n"
+            "Введите новый заголовок или отправьте тот же:"
+        )
+        await state.set_state(KnowledgeBaseState.editing_title)
+        
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка: неверный формат ID материала")
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка базы данных при редактировании материала: {e}")
+        await callback.answer("Произошла ошибка при загрузке материала")
+    finally:
+        await callback.answer()
+
+@dp.message(KnowledgeBaseState.editing_title)
+async def edit_material_title(message: types.Message, state: FSMContext):
+    """Редактирование заголовка материала"""
+    if len(message.text) > 100:
+        await message.answer("Название слишком длинное. Максимум 100 символов.")
+        return
+    
+    await state.update_data(title=message.text)
+    data = await state.get_data()
+    await message.answer(
+        f"Текущее содержание:\n{escape(data['content'])}\n\n"
+        "Введите новое содержание или отправьте то же:"
+    )
+    await state.set_state(KnowledgeBaseState.editing_text)
+
+@dp.message(KnowledgeBaseState.editing_text)
+async def edit_material_text(message: types.Message, state: FSMContext):
+    """Редактирование содержания материала"""
+    if len(message.text) > 5000:
+        await message.answer("Содержание слишком длинное. Максимум 5000 символов.")
+        return
+    
+    await state.update_data(content=message.text)
+    data = await state.get_data()
+    await message.answer(
+        f"Текущая категория:\n{escape(data['category'])}\n\n"
+        "Введите новую категорию или отправьте ту же:"
+    )
+    await state.set_state(KnowledgeBaseState.editing_category)
+
+@dp.message(KnowledgeBaseState.editing_category)
+async def edit_material_category(message: types.Message, state: FSMContext):
+    """Редактирование категории материала"""
+    if len(message.text) > 50:
+        await message.answer("Название категории слишком длинное. Максимум 50 символов.")
+        return
+    
+    await state.update_data(category=message.text)
+    data = await state.get_data()
+    
+    preview = (
+        "<b>Предпросмотр изменений:</b>\n\n"
+        f"Заголовок: {escape(data['title'])}\n"
+        f"Содержание: {escape(data['content'])}\n"
+        f"Категория: {escape(data['category'])}"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Сохранить изменения", callback_data="save_material_edit")
+    kb.button(text="Отмена", callback_data="cancel_material_edit")
+    kb.adjust(2)
+    
+    await message.answer(preview, parse_mode="HTML", reply_markup=kb.as_markup())
+    await state.set_state(KnowledgeBaseState.confirming_edit)
+
+@dp.callback_query(F.data == "save_material_edit", KnowledgeBaseState.confirming_edit)
+async def save_material_edit(callback: types.CallbackQuery, state: FSMContext):
+    """Сохранение изменений материала"""
+    data = await state.get_data()
+    mid = data['material_id']
+    title = data['title']
+    content = data['content']
+    category = data['category']
+    updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    try:
+        cursor.execute(
+            "UPDATE knowledge_base SET title=?, content=?, category=?, updated_at=? WHERE id=?",
+            (title, content, category, updated_at, mid)
+        )
+        conn.commit()
+        await callback.message.answer("✅ Материал успешно обновлен!")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in save_material_edit: {e}")
+        await callback.message.answer("Произошла ошибка при сохранении изменений.")
+    finally:
+        await state.clear()
+        await callback.answer()
+
+@dp.callback_query(F.data == "cancel_material_edit", KnowledgeBaseState.confirming_edit)
+async def cancel_material_edit(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена редактирования материала"""
+    await callback.message.answer("Редактирование отменено.")
+    await state.clear()
+    await callback.answer()
+
+# Удаление материала
+@dp.callback_query(F.data.startswith("delete_material_"))
+async def delete_material(callback: types.CallbackQuery):
+    """Запрос подтверждения удаления материала"""
+    try:
+        mid = int(callback.data.split("_")[-1])
+        cursor.execute(
+            "SELECT author_id FROM knowledge_base WHERE id=?",
+            (mid,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            return await callback.answer("Материал не найден.")
+        
+        author_id = row[0]
+        role = get_user_role(callback.from_user.id)
+        
+        # Проверка прав на удаление
+        if role != "admin" and (callback.from_user.id != author_id or role != "teacher"):
+            return await callback.answer("У вас нет прав на удаление этого материала.")
+        
+        # Подтверждение удаления
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Да, удалить", callback_data=f"confirm_delete_{mid}")
+        kb.button(text="❌ Отмена", callback_data=f"cancel_delete_{mid}")
+        kb.adjust(2)
+        
+        await callback.message.answer(
+            "Вы уверены, что хотите удалить этот материал?",
+            reply_markup=kb.as_markup()
+        )
+    except (ValueError, IndexError):
+        await callback.answer("Неверный идентификатор материала")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in delete_material: {e}")
+        await callback.answer("Произошла ошибка")
+    finally:
+        await callback.answer()
+
+@dp.callback_query(F.data.startswith("confirm_delete_"))
+async def confirm_delete_material(callback: types.CallbackQuery):
+    """Подтверждение удаления материала"""
+    try:
+        mid = int(callback.data.split("_")[-1])
+        cursor.execute(
+            "SELECT author_id FROM knowledge_base WHERE id=?",
+            (mid,)
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            return await callback.answer("Материал не найден.")
+        
+        author_id = row[0]
+        role = get_user_role(callback.from_user.id)
+        
+        # Проверка прав на удаление
+        if role != "admin" and (callback.from_user.id != author_id or role != "teacher"):
+            return await callback.answer("У вас нет прав на удаление этого материала.")
+        
+        # Удаление материала
+        cursor.execute(
+            "DELETE FROM knowledge_base WHERE id=?",
+            (mid,)
+        )
+        conn.commit()
+        await callback.message.answer("✅ Материал успешно удален!")
+    except (ValueError, IndexError):
+        await callback.answer("Неверный идентификатор материала")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in confirm_delete_material: {e}")
+        await callback.message.answer("Произошла ошибка при удалении материала.")
+    finally:
+        await callback.answer()
+
+@dp.callback_query(F.data.startswith("cancel_delete_"))
+async def cancel_delete_material(callback: types.CallbackQuery):
+    """Отмена удаления материала"""
+    await callback.message.answer("Удаление отменено.")
+    await callback.answer()
+
+# Администрирование
+@dp.message(F.text == "Администрирование")
+async def admin_panel(message: types.Message):
+    """Панель администратора"""
+    if get_user_role(message.from_user.id) != "admin":
+        return await message.answer("Доступ запрещен.")
+    
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="Добавить пользователя")
+    kb.button(text="Список пользователей")
+    kb.button(text="Удалить пользователя")  # Новая кнопка
+    kb.button(text="Назад")
+    kb.adjust(2, 2)
+    await message.answer("Админ-панель:", reply_markup=kb.as_markup(resize_keyboard=True))
+
+@dp.message(F.text == "Удалить пользователя")
+async def delete_user_start(message: types.Message, state: FSMContext):
+    """Начало процесса удаления пользователя"""
+    if get_user_role(message.from_user.id) != "admin":
+        return await message.answer("Доступ запрещен.")
+    
+    try:
+        cursor.execute("SELECT user_id, full_name, role FROM users ORDER BY full_name")
+        users = cursor.fetchall()
+        
+        if not users:
+            return await message.answer("Нет пользователей для удаления.")
+        
+        kb = InlineKeyboardBuilder()
+        for user_id, full_name, role in users:
+            kb.button(text=f"{escape(full_name)} ({role})", callback_data=f"delete_user_{user_id}")
+        kb.adjust(1)
+        
+        await message.answer("Выберите пользователя для удаления:", reply_markup=kb.as_markup())
+    except sqlite3.Error as e:
+        logger.error(f"Database error in delete_user_start: {e}")
+        await message.answer("Произошла ошибка при загрузке списка пользователей.")
+@dp.callback_query(F.data.startswith("delete_user_"))
+async def select_user_to_delete(callback: types.CallbackQuery):
+    """Подтверждение удаления пользователя"""
+    try:
+        user_id = int(callback.data.split("_")[-1])
+        
+        cursor.execute(
+            "SELECT full_name, role FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        user = cursor.fetchone()
+        
+        if not user:
+            return await callback.answer("Пользователь не найден.")
+        
+        full_name, role = user
+        
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Да, удалить", callback_data=f"confirm_user_delete_{user_id}")
+        kb.button(text="❌ Отмена", callback_data="cancel_user_delete")
+        kb.adjust(2)
+        
+        await callback.message.answer(
+            f"Вы уверены, что хотите удалить пользователя {escape(full_name)} ({role})?",
+            reply_markup=kb.as_markup()
+        )
+    except (ValueError, IndexError):
+        await callback.answer("Неверный идентификатор пользователя")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in select_user_to_delete: {e}")
+        await callback.answer("Произошла ошибка")
+    finally:
+        await callback.answer()
+
+@dp.message(F.text == "Назад")
+async def back_to_main_menu(message: types.Message):
+    """Возврат в главное меню"""
+    await show_main_menu(message, message.from_user.id)
+
+@dp.callback_query(F.data == "main_menu")
+async def back_to_main_menu_callback(callback: types.CallbackQuery):
+    """Возврат в главное меню (callback)"""
+    await show_main_menu(callback.message, callback.from_user.id)
+    await callback.answer()
+
+@dp.message(F.text == "Список пользователей")
+async def list_users(message: types.Message):
+    """Просмотр списка пользователей"""
+    if get_user_role(message.from_user.id) != "admin":
+        return await message.answer("Доступ запрещен.")
+    
+    try:
+        cursor.execute("SELECT full_name,role,group_name,is_verified FROM users ORDER BY role,full_name")
+        rows = cursor.fetchall()
+        txt = "Список пользователей:\n\n"
+        
+        for fn, r, g, v in rows:
+            status = "✅" if v else "❌"
+            txt += f"{escape(fn)} ({r}) {status}"
+            if r == "student" and g:
+                txt += f", {escape(g)}"
+            txt += "\n"
+        
+        await message.answer(txt)
+    except sqlite3.Error as e:
+        logger.error(f"Database error in list_users: {e}")
+        await message.answer("Произошла ошибка при загрузке списка пользователей.")
+
+@dp.message(F.text == "Добавить пользователя")
+async def add_user(message: types.Message, state: FSMContext):
+    """Добавление нового пользователя"""
+    if get_user_role(message.from_user.id) != "admin":
+        return
+    
+    await message.answer(
+        "Введите данные в формате:\n"
+        "login,password,ФИО,role,group(если студент),student_id(если студент)\n\n"
+        "Пример:\n"
+        "ivanov,12345,Иванов Иван Иванович,student,ИВТ-21,12345678"
+    )
+    await state.set_state(AdminState.waiting_for_new_user_data)
+@dp.callback_query(F.data.startswith("confirm_user_delete_"))
+async def confirm_user_delete(callback: types.CallbackQuery):
+    """Фактическое удаление пользователя"""
+    try:
+        user_id = int(callback.data.split("_")[-1])
+        
+        cursor.execute(
+            "SELECT full_name FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        user = cursor.fetchone()
+        
+        if not user:
+            return await callback.answer("Пользователь не найден.")
+        
+        full_name = user[0]
+        
+        # Удаляем пользователя
+        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM pre_registered_users WHERE login = (SELECT login FROM users WHERE user_id = ?)", (user_id,))
+        conn.commit()
+        
+        await callback.message.answer(f"✅ Пользователь {escape(full_name)} успешно удалён!")
+    except (ValueError, IndexError):
+        await callback.answer("Неверный идентификатор пользователя")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in confirm_user_delete: {e}")
+        await callback.message.answer("Произошла ошибка при удалении пользователя.")
+    finally:
+        await callback.answer()
+
+@dp.callback_query(F.data == "cancel_user_delete")
+async def cancel_user_delete(callback: types.CallbackQuery):
+    """Отмена удаления пользователя"""
+    await callback.message.answer("Удаление отменено.")
+    await callback.answer()
+
+    
+@dp.message(AdminState.waiting_for_new_user_data)
+async def process_new_user(message: types.Message, state: FSMContext):
+    """Обработка данных нового пользователя"""
+    try:
+        parts = [p.strip() for p in message.text.split(',')]
+        if len(parts) < 4:
+            raise ValueError("Недостаточно данных")
+        
+        # Валидация данных
+        if not validate_login(parts[0]):
+            return await message.answer("Логин содержит недопустимые символы.")
+        
+        if not validate_name(parts[2]):
+            return await message.answer("ФИО содержит недопустимые символы.")
+        
+        if parts[3] not in ("student","teacher","admin"):
+            return await message.answer("Недопустимая роль пользователя.")
+        
+        if parts[3] == "student":
+            if len(parts) < 6:
+                return await message.answer("Для студента необходимо указать группу и номер студенческого.")
+            
+            if not validate_group(parts[4]):
+                return await message.answer("Название группы содержит недопустимые символы.")
+            
+            if not validate_student_id(parts[5]):
+                return await message.answer("Номер студенческого должен состоять из 8 цифр.")
+            
+            grp = parts[4]
+            sid = parts[5]
+        else:
+            grp = None
+            sid = None
+        
+        # Хеширование пароля
+        hashed_pwd = hash_password(parts[1])
+        
+        # Добавление пользователя
+        cursor.execute(
+            "INSERT INTO pre_registered_users (login,password,full_name,role,group_name,student_id) VALUES (?,?,?,?,?,?)",
+            (parts[0], hashed_pwd, parts[2], parts[3], grp, sid)
+        )
+        conn.commit()
+        await message.answer("✅ Пользователь успешно добавлен!")
+    except ValueError as e:
+        logger.error(f"Validation error in process_new_user: {e}")
+        await message.answer("❌ Ошибка формата. Проверьте введенные данные.")
+    except sqlite3.IntegrityError:
+        await message.answer("❌ Пользователь с таким логином уже существует.")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in process_new_user: {e}")
+        await message.answer("❌ Произошла ошибка при добавлении пользователя.")
+    finally:
+        await state.clear()
+
+# Настройка времени приема
+@dp.message(F.text == "⏰ Настройка времени приема")
+async def schedule_settings(message: types.Message, state: FSMContext):
+    """Настройка времени приема сообщений"""
+    await state.clear()
+    uid = message.from_user.id
+    
+    try:
+        cursor.execute("SELECT start_time,end_time FROM message_schedule WHERE user_id=?", (uid,))
+        sch = cursor.fetchone()
+        
+        text = "⏰ Настройки приёма сообщений\n\n"
+        kb = InlineKeyboardBuilder()
+        
+        if sch:
+            text += f"Текущее время приема: {sch[0]} - {sch[1]}\n\n"
+            kb.button(text="✏️ Изменить время", callback_data="edit_schedule")
+            kb.button(text="❌ Отключить ограничения", callback_data="remove_schedule")
+        else:
+            text += "Ограничений по времени приема нет.\n"
+            kb.button(text="➕ Установить время", callback_data="set_schedule")
+        
+        kb.button(text="🔙 Главное меню", callback_data="main_menu")
+        kb.adjust(1)
+        await message.answer(text, reply_markup=kb.as_markup())
+    except sqlite3.Error as e:
+        logger.error(f"Database error in schedule_settings: {e}")
+        await message.answer("Произошла ошибка при загрузке настроек.")
+
+@dp.callback_query(F.data.in_(["set_schedule","edit_schedule"]))
+async def start_time_setup(callback: types.CallbackQuery, state: FSMContext):
+    """Начало настройки времени приема"""
+    uid = callback.from_user.id
+    
+    try:
+        cursor.execute("SELECT start_time,end_time FROM message_schedule WHERE user_id=?", (uid,))
+        cur = cursor.fetchone()
+        
+        if cur:
+            await state.update_data(cur_start=cur[0], cur_end=cur[1])
+        
+        kb = InlineKeyboardBuilder()
+        if cur:
+            kb.button(text=f"Текущее: {cur[0]}", callback_data="use_current_start")
+        
+        await callback.message.answer(
+            "Введите время начала в формате ЧЧ:ММ (например, 09:00):",
+            reply_markup=kb.as_markup() if cur else None
+        )
+        await state.set_state(ScheduleState.waiting_for_start_time)
+    except sqlite3.Error as e:
+        logger.error(f"Database error in start_time_setup: {e}")
+        await callback.message.answer("Произошла ошибка.")
+    finally:
+        await callback.answer()
+
+@dp.callback_query(F.data == "use_current_start", ScheduleState.waiting_for_start_time)
+async def use_cur_start(callback: types.CallbackQuery, state: FSMContext):
+    """Использование текущего времени начала"""
+    data = await state.get_data()
+    await state.update_data(new_start=data['cur_start'])
+    
+    kb = InlineKeyboardBuilder()
+    if 'cur_end' in data:
+        kb.button(text=f"Текущее: {data['cur_end']}", callback_data="use_current_end")
+    
+    await callback.message.answer(
+        f"Начало: {data['cur_start']}\nВведите время окончания в формате ЧЧ:ММ:",
+        reply_markup=kb.as_markup() if 'cur_end' in data else None
+    )
+    await state.set_state(ScheduleState.waiting_for_end_time)
+    await callback.answer()
+
+@dp.callback_query(F.data == "use_current_end", ScheduleState.waiting_for_end_time)
+async def use_cur_end(callback: types.CallbackQuery, state: FSMContext):
+    """Использование текущего времени окончания"""
+    data = await state.get_data()
+    start = data.get('new_start', data['cur_start'])
+    end = data['cur_end']
+    await save_schedule(callback.message, start, end, callback.from_user.id)
+    await state.clear()
+    await callback.answer()
+
+@dp.message(ScheduleState.waiting_for_start_time)
+async def process_start_time(message: types.Message, state: FSMContext):
+    """Обработка времени начала"""
+    try:
+        # Проверка формата времени
+        datetime.strptime(message.text, "%H:%M")
+        await state.update_data(new_start=message.text)
+        await message.answer("Введите время окончания в формате ЧЧ:ММ:")
+        await state.set_state(ScheduleState.waiting_for_end_time)
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Используйте ЧЧ:ММ (например, 18:00)")
+
+@dp.message(ScheduleState.waiting_for_end_time)
+async def process_end_time(message: types.Message, state: FSMContext):
+    """Обработка времени окончания"""
+    try:
+        # Проверка формата времени
+        datetime.strptime(message.text, "%H:%M")
+        data = await state.get_data()
+        start = data['new_start']
+        end = message.text
+        
+        # Проверка, что время окончания позже времени начала
+        if datetime.strptime(end, "%H:%M") <= datetime.strptime(start, "%H:%M"):
+            return await message.answer("❌ Время окончания должно быть позже времени начала.")
+        
+        await save_schedule(message, start, end, message.from_user.id)
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Используйте ЧЧ:ММ (например, 18:00)")
+
+async def save_schedule(msg: types.Message, start: str, end: str, uid: int):
+    """Сохранение настроек времени приема"""
+    try:
+        cursor.execute(
+            "INSERT OR REPLACE INTO message_schedule (user_id,start_time,end_time) VALUES(?,?,?)",
+            (uid, start, end)
+        )
+        conn.commit()
+        await msg.answer(f"✅ Время приема сообщений сохранено: {start} - {end}")
+        await schedule_settings(msg, FSMContext)
+    except sqlite3.Error as e:
+        logger.error(f"Database error in save_schedule: {e}")
+        await msg.answer("Произошла ошибка при сохранении настроек.")
+
+@dp.callback_query(F.data == "remove_schedule")
+async def remove_schedule(callback: types.CallbackQuery):
+    """Удаление настроек времени приема"""
+    uid = callback.from_user.id
+    
+    try:
+        cursor.execute("DELETE FROM message_schedule WHERE user_id=?", (uid,))
+        conn.commit()
+        await callback.message.answer("✅ Ограничения по времени сняты.")
+    except sqlite3.Error as e:
+        logger.error(f"Database error in remove_schedule: {e}")
+        await callback.message.answer("Произошла ошибка при удалении настроек.")
+    finally:
+        await schedule_settings(callback.message, FSMContext)
+        await callback.answer()
+
+async def main():
+    """Основная функция запуска бота"""
+    try:
+        setup_database()
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+    finally:
+        # Закрытие соединения с БД при завершении работы
+        conn.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
